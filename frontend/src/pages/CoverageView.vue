@@ -4,7 +4,7 @@
  * 汇总各样带的珊瑚覆盖率、白化指数与鱼类密度；查看结构版本并导入导出全量 JSON。
  * 复用 <BleachTag>、<FilterBar>。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadFile } from 'element-plus'
@@ -17,6 +17,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useReefStore } from '@/stores/reefStore'
 import { useSurveyStore } from '@/stores/surveyStore'
+import { useBoundaryStore } from '@/stores/boundaryStore'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { BleachLevel } from '@/types/coralRecord'
 import { BLEACH_COLOR } from '@/utils/bleach'
@@ -30,9 +31,10 @@ import {
   type BackupPayload
 } from '@/utils/db'
 import {
+  allocatePayload,
   buildBackupPayload,
-  buildReefSummaries,
   countPayload,
+  exportAllocationCsv,
   exportBackupJson,
   importBackup,
   readFileText,
@@ -45,13 +47,27 @@ const route = useRoute()
 const router = useRouter()
 const reefStore = useReefStore()
 const surveyStore = useSurveyStore()
+const boundaryStore = useBoundaryStore()
 
-const EMPTY_COUNTS: CountMap = { reefs: 0, sites: 0, belts: 0, corals: 0, fishes: 0 }
+const EMPTY_COUNTS: CountMap = {
+  reefs: 0,
+  sites: 0,
+  belts: 0,
+  corals: 0,
+  fishes: 0,
+  boundaryVersions: 0,
+  beltSegments: 0,
+  boundaryNotices: 0,
+  boundaryRevisions: 0
+}
 
 const counts = ref<CountMap>(EMPTY_COUNTS)
 const lastBackupAt = ref<string | null>(null)
 const stampedVersion = ref<number>(DB_VERSION)
-const reefSummaries = ref<ReturnType<typeof buildReefSummaries>>([])
+/** 礁区汇总：走分摊引擎（按段长分摊），与导出 CSV 同一口径 */
+const reefSummaries = ref<ReturnType<typeof allocatePayload>['reefSummaries']>([])
+const pendingItems = ref<ReturnType<typeof allocatePayload>['pending']>([])
+const activeBoundaryVersion = ref<number | null>(null)
 const overwriteOnImport = ref(true)
 const fileList = ref<UploadFile[]>([])
 const busy = ref(false)
@@ -63,13 +79,55 @@ const filterModel = computed<FilterModel>(() => ({
   bleachLevels: surveyStore.filter.bleachLevels
 }))
 
-const rows = computed(() => surveyStore.filteredCoverageRows)
+/** 逐条样带表也走分摊口径（与礁区汇总、CSV 导出同一 allocation 结果），挂起段已被排除 */
+const rows = computed(() => {
+  const result = boundaryStore.allocation
+  if (!result) return []
+  const reefNameById = new Map(reefStore.reefs.map((reef) => [reef.id, reef.name]))
+  const filtered = result.lines.filter((line) => {
+    const keyword = surveyStore.filter.keyword.trim()
+    if (keyword.length > 0) {
+      const haystack = `${reefNameById.get(line.reefId) ?? ''}${line.siteNo}${line.beltNo}${line.observer}`
+      if (!haystack.includes(keyword)) return false
+    }
+    if (surveyStore.filter.reefIds.length > 0 && !surveyStore.filter.reefIds.includes(line.reefId)) return false
+    if (surveyStore.filter.bleachLevels.length > 0) {
+      const matched = surveyStore.filter.bleachLevels.some((level) => line.distribution[level] > 0)
+      if (!matched) return false
+    }
+    if (surveyStore.filter.onlyBleached && line.bleachedSharePct <= 0) return false
+    return true
+  })
+  return filtered.map((line) => ({
+    beltId: line.beltId,
+    beltNo: line.beltNo,
+    reefId: line.reefId,
+    reefName: reefNameById.get(line.reefId) ?? line.reefId,
+    siteNo: line.siteNo,
+    lengthM: line.allocatedLengthM,
+    orientation: line.orientation,
+    surveyDate: line.surveyDate,
+    observer: line.observer,
+    coralCount: line.coralCount,
+    coverCmTotal: line.coverCm,
+    coveragePct: line.coveragePct,
+    bleachIndex: line.bleachIndex,
+    grade: line.grade,
+    bleachedSharePct: line.bleachedSharePct,
+    distribution: line.distribution,
+    fishTotal: line.fishTotal,
+    invertebrateTotal: line.invertebrateTotal,
+    fishDensity: line.fishDensity,
+    share: line.share
+  }))
+})
 
 const totals = computed(() => ({
+  /** 分摊行数（跨界样带在每个礁区各一行） */
   belts: rows.value.length,
   coralCount: rows.value.reduce((sum, row) => sum + row.coralCount, 0),
-  coverCmTotal: rows.value.reduce((sum, row) => sum + row.coverCmTotal, 0),
-  fishTotal: rows.value.reduce((sum, row) => sum + row.fishTotal, 0),
+  coverCmTotal: Number(rows.value.reduce((sum, row) => sum + row.coverCmTotal, 0).toFixed(1)),
+  fishTotal: Number(rows.value.reduce((sum, row) => sum + row.fishTotal, 0).toFixed(1)),
   avgCoveragePct:
     rows.value.length === 0
       ? 0
@@ -81,7 +139,7 @@ const totals = computed(() => ({
   bleachedBelts: rows.value.filter((row) => row.bleachedSharePct > 0).length
 }))
 
-/** 当前筛选结果内的白化等级分布 */
+/** 当前筛选结果内的白化等级分布（摊入覆盖长度） */
 const distribution = computed<Record<BleachLevel, number>>(() => {
   const result: Record<BleachLevel, number> = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
   BLEACH_LEVELS.forEach((level) => {
@@ -104,29 +162,11 @@ async function refresh(): Promise<void> {
   lastBackupAt.value = readLastBackupAt()
   stampedVersion.value = readStampedDbVersion()
   const payload = await buildBackupPayload()
-  reefSummaries.value = buildReefSummaries(payload, surveyStore.coverageRows.map((row) => ({
-    beltId: row.beltId,
-    beltNo: row.beltNo,
-    reefId: row.reefId,
-    reefName: row.reefName,
-    siteId: row.siteId,
-    siteNo: row.siteNo,
-    lengthM: row.lengthM,
-    orientation: row.orientation,
-    surveyDate: row.surveyDate,
-    observer: row.observer,
-    coralCount: row.coralCount,
-    coverCmTotal: row.coverCmTotal,
-    coveragePct: row.coveragePct,
-    bleachIndex: row.bleachIndex,
-    grade: row.grade,
-    bleachedSharePct: row.bleachedSharePct,
-    distribution: row.distribution,
-    fishTotal: row.fishTotal,
-    invertebrateTotal: row.invertebrateTotal,
-    fishDensity: row.fishDensity,
-    conclusion: ''
-  })))
+  // 礁区白化与导出共用分摊引擎：按段长分摊，挂起段不入统
+  const result = allocatePayload(payload)
+  reefSummaries.value = result.reefSummaries
+  pendingItems.value = result.pending
+  activeBoundaryVersion.value = result.boundaryVersion
 }
 
 function handleFilterChange(): void {
@@ -151,6 +191,17 @@ async function handleExport(): Promise<void> {
     const result = await exportBackupJson()
     await refresh()
     notice.value = `已导出 ${result.fileName}（共 ${Object.values(result.counts).reduce((sum, value) => sum + value, 0)} 条记录）。`
+    ElMessage.success(notice.value)
+  } finally {
+    busy.value = false
+  }
+}
+
+async function handleExportCsv(): Promise<void> {
+  busy.value = true
+  try {
+    const result = await exportAllocationCsv()
+    notice.value = `已按界线 v${activeBoundaryVersion.value ?? '—'} 导出门槛 CSV：礁区 ${result.reefCount}、分摊行 ${result.lineCount}、挂起 ${result.pendingCount}（挂起未入统）。`
     ElMessage.success(notice.value)
   } finally {
     busy.value = false
@@ -217,7 +268,7 @@ async function copySummary(): Promise<void> {
   const text = rows.value
     .map(
       (row) =>
-        `${row.reefName}｜站位 ${row.siteNo}｜样带 ${row.beltNo}（${row.orientation}向 ${row.lengthM} m）：珊瑚覆盖率 ${row.coveragePct}%，白化指数 ${row.bleachIndex}（${row.grade}），白化占比 ${row.bleachedSharePct}%，鱼类 ${row.fishTotal} 尾（${row.fishDensity} 尾/100m²）`
+        `${row.reefName}｜站位 ${row.siteNo}｜样带 ${row.beltNo}（${row.orientation}向，摊入 ${row.lengthM} m / ${(row.share * 100).toFixed(0)}%）：珊瑚覆盖率 ${row.coveragePct}%，白化指数 ${row.bleachIndex}（${row.grade}），白化占比 ${row.bleachedSharePct}%，鱼类 ${row.fishTotal} 尾（${row.fishDensity} 尾/100m²）`
     )
     .join('\n')
   try {
@@ -231,6 +282,7 @@ async function copySummary(): Promise<void> {
 }
 
 onMounted(() => {
+  boundaryStore.start()
   surveyStore.patchFilter({
     keyword: typeof route.query.kw === 'string' ? route.query.kw : '',
     reefIds: queryToArray(route.query.reef),
@@ -239,6 +291,14 @@ onMounted(() => {
   })
   void refresh()
 })
+
+// 界线版本变化（重算/切换）后自动刷新分摊汇总
+watch(
+  () => boundaryStore.activeVersion?.id,
+  () => {
+    if (boundaryStore.activeVersion) void refresh()
+  }
+)
 </script>
 
 <template>
@@ -255,6 +315,7 @@ onMounted(() => {
       <div class="page__actions">
         <el-button :icon="Refresh" @click="refresh">刷新</el-button>
         <el-button @click="copySummary">复制结论</el-button>
+        <el-button type="success" plain :loading="busy" @click="handleExportCsv">导出门槛 CSV（分摊口径）</el-button>
         <el-button type="primary" :icon="Download" :loading="busy" @click="handleExport">导出 JSON</el-button>
       </div>
     </div>
@@ -300,10 +361,10 @@ onMounted(() => {
 
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
-        <h3>白化等级分布（覆盖长度 cm）</h3>
+        <h3>白化等级分布（摊入覆盖长度 cm）</h3>
         <span class="gb-hint">
-          总体白化指数 {{ surveyStore.globalStats.bleachIndex }}（{{ surveyStore.globalStats.grade }}）· 白化占比
-          {{ surveyStore.globalStats.bleachedSharePct }}% · 存在白化样带 {{ totals.bleachedBelts }} 条
+          按当前界线版本与筛选结果的摊入覆盖长度计 · 存在白化样带 {{ totals.bleachedBelts }} 条 ·
+          挂起段不计入
         </span>
       </div>
       <div class="gb-bars">
@@ -322,13 +383,13 @@ onMounted(() => {
 
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
-        <h3>按样带的覆盖度成果（{{ rows.length }} 条）</h3>
-        <span class="gb-hint">按白化指数降序排列</span>
+        <h3>样带 × 礁区分摊成果（{{ rows.length }} 行）</h3>
+        <span class="gb-hint">跨界样带按段长分摊，每个礁区一行；按白化指数降序，挂起段不入表</span>
       </div>
 
       <EmptyPanel
         v-if="rows.length === 0"
-        title="没有符合条件的样带"
+        title="没有符合条件的分摊行"
         description="请先到礁区台账布设站位与样带，并录入珊瑚分类覆盖与鱼类计数；也可调整当前筛选条件。"
         compact
       />
@@ -340,9 +401,10 @@ onMounted(() => {
             <div class="gb-hint">站位 {{ row.siteNo }} · 样带 {{ row.beltNo }}（{{ row.orientation }}向）</div>
           </template>
         </el-table-column>
-        <el-table-column label="样带长度" width="110" align="right">
+        <el-table-column label="摊入长度" width="120" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.lengthM }} m</span>
+            <div class="gb-hint gb-mono">分摊 {{ (row.share * 100).toFixed(0) }}%</div>
           </template>
         </el-table-column>
         <el-table-column label="珊瑚记录" width="100" align="right">
@@ -401,38 +463,67 @@ onMounted(() => {
 
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
-        <h3>按礁区的白化评定</h3>
-        <span class="gb-hint">平均白化指数为礁区内各样带白化指数的算术平均</span>
+        <h3>按礁区的白化评定（界线 v{{ activeBoundaryVersion ?? '—' }} · 按段长分摊）</h3>
+        <span class="gb-hint">
+          跨界样带按段长 share 摊入；白化指数 = 摊入覆盖长度加权平均，与导出 CSV 同口径；挂起样带不计入
+        </span>
       </div>
       <el-table :data="reefSummaries" border stripe class="gb-table-compact">
-        <el-table-column prop="reefName" label="礁区" min-width="160" />
-        <el-table-column prop="protectStatus" label="保护区状态" width="130" />
-        <el-table-column label="站位 / 样带" width="130" align="right">
+        <el-table-column prop="reefName" label="礁区" min-width="150" />
+        <el-table-column prop="protectStatus" label="保护区状态" width="110" />
+        <el-table-column label="摊入样带" width="92" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.siteCount }} / {{ row.beltCount }}</span>
+            <span class="gb-mono">{{ row.beltCount }} 条</span>
           </template>
         </el-table-column>
-        <el-table-column label="珊瑚记录" width="110" align="right">
+        <el-table-column label="摊入长度" width="110" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.coralCount }}</span>
+            <span class="gb-mono">{{ row.allocatedLengthM }} m</span>
           </template>
         </el-table-column>
-        <el-table-column label="覆盖长度" width="130" align="right">
+        <el-table-column label="覆盖率" width="96" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.coverCmTotal }} cm</span>
+            <span class="gb-mono">{{ row.coveragePct }}%</span>
           </template>
         </el-table-column>
-        <el-table-column label="平均白化指数" width="160">
+        <el-table-column label="摊入覆盖" width="118" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.coverCm }} cm</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="白化指数" width="160">
           <template #default="{ row }">
             <BleachTag :level="row.grade" size="small" />
-            <span class="gb-hint gb-mono"> {{ row.avgBleachIndex }}</span>
+            <span class="gb-hint gb-mono"> {{ row.bleachIndex }} · 白化 {{ row.bleachedSharePct }}%</span>
           </template>
         </el-table-column>
-        <el-table-column label="鱼类计数" width="120" align="right">
+        <el-table-column label="摊入鱼类" width="110" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.fishTotal }}</span>
+            <span class="gb-mono">{{ row.fishTotal }} 尾</span>
           </template>
         </el-table-column>
+        <el-table-column label="鱼类密度" width="130" align="right">
+          <template #default="{ row }">
+            <span class="gb-mono">{{ row.fishDensity }} 尾/100m²</span>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-card v-if="pendingItems.length > 0" shadow="never" class="gb-panel">
+      <div class="gb-panel-title">
+        <h3>挂起样带（对不上账 / 落在界外，未入礁区白化与导出）</h3>
+        <span class="gb-hint">共 {{ pendingItems.length }} 段，需两室按样带编号销账后才入统</span>
+      </div>
+      <el-table :data="pendingItems" border stripe class="gb-table-compact">
+        <el-table-column prop="beltNo" label="样带编号" width="110" />
+        <el-table-column label="界线版本" width="100" align="center">
+          <template #default="{ row }">v{{ row.boundaryVersion }}</template>
+        </el-table-column>
+        <el-table-column label="挂起段长" width="110" align="right">
+          <template #default="{ row }"><span class="gb-mono">{{ row.lengthM }} m（{{ (row.share * 100).toFixed(1) }}%）</span></template>
+        </el-table-column>
+        <el-table-column prop="reason" label="挂起原因" min-width="260" />
       </el-table>
     </el-card>
 
@@ -440,7 +531,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>结构版本与全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 reefs / sites / belts / corals / fishes 五张表 · 最近备份
+          导出含外业五表 + 界线四表（版本/切段/对账/流水）共九张表 · 最近备份
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </span>
       </div>
