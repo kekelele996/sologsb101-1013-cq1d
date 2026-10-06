@@ -7,6 +7,8 @@ import { computed, ref } from 'vue'
 import { db, createId, watchTable } from '@/utils/db'
 import type { Belt, BeltDraft, Orientation } from '@/types/belt'
 import { ORIENTATIONS, createEmptyBeltDraft } from '@/types/belt'
+import type { LatLng } from '@/types/reef'
+import { reconcileBeltById, settleBelt, type BeltSettleResult } from '@/utils/boundarySettle'
 
 /** 朝向排序权重：北 → 东 → 南 → 西 */
 export const ORIENTATION_ORDER: Record<Orientation, number> = {
@@ -63,6 +65,21 @@ export const useBeltStore = defineStore('belt', () => {
     return stats
   })
 
+  /** 挂账样带（两边按编号对账对不上，先挂着不进礁区白化评定） */
+  const pendingBelts = computed<Belt[]>(() => belts.value.filter((belt) => belt.settleStatus === 'pending'))
+
+  /** 压在两个及以上礁区的跨界样带 */
+  const crossReefBelts = computed<Belt[]>(() => {
+    const cross = (belt: Belt): boolean => new Set(belt.segments.map((segment) => segment.reefId)).size > 1
+    return belts.value.filter(cross)
+  })
+
+  /** 某条样带在各礁区的分段（挂账 / 跨界提示用） */
+  function segmentsOfBelt(beltId: string | null | undefined): Belt['segments'] {
+    const belt = belts.value.find((item) => item.id === beltId)
+    return belt ? belt.segments : []
+  }
+
   /** 朝向分布统计（按样带条数） */
   const orientationStats = computed<Record<Orientation, number>>(() => {
     const stats: Record<Orientation, number> = { 北: 0, 东: 0, 南: 0, 西: 0 }
@@ -98,18 +115,81 @@ export const useBeltStore = defineStore('belt', () => {
     return belts.value.find((belt) => belt.id === id) ?? null
   }
 
+  /** 新建样带时按当前界线切段；取不到界线信息时整段先挂在起点礁区 */
+  async function initialSegments(
+    siteId: string,
+    startPoint: LatLng,
+    endPoint: LatLng,
+    lengthM: number
+  ): Promise<Pick<Belt, 'segments' | 'settleStatus' | 'settleIssue' | 'boundaryRevByReef'>> {
+    const [site, reefs, sites] = await Promise.all([db.sites.get(siteId), db.reefs.toArray(), db.sites.toArray()])
+    if (!site) {
+      return { segments: [], settleStatus: 'pending', settleIssue: '站位不存在', boundaryRevByReef: {} }
+    }
+    const probe: Belt = {
+      id: '__probe__',
+      siteId,
+      no: '',
+      lengthM,
+      orientation: '北',
+      surveyDate: '',
+      observer: '',
+      startPoint,
+      endPoint,
+      legacyPoints: false,
+      segments: [],
+      allocationMode: 'prorate',
+      settleStatus: 'settled',
+      settleIssue: '',
+      boundaryRevByReef: {},
+      createdAt: 0,
+      updatedAt: 0
+    }
+    const result = settleBelt(probe, reefs, new Map(sites.map((item) => [item.id, { reefId: item.reefId }])))
+    const revByReef: Record<string, number> = {}
+    result.segments.forEach((segment) => {
+      const reef = reefs.find((item) => item.id === segment.reefId)
+      if (reef) revByReef[segment.reefId] = reef.boundaryRev
+    })
+    return {
+      segments: result.segments,
+      settleStatus: result.status,
+      settleIssue: result.issue,
+      boundaryRevByReef: revByReef
+    }
+  }
+
   async function createBelt(
     siteId: string,
-    payload: Omit<Belt, 'id' | 'createdAt' | 'updatedAt' | 'siteId'>
+    payload: Omit<Belt, 'id' | 'createdAt' | 'updatedAt' | 'siteId' | 'segments' | 'settleStatus' | 'settleIssue' | 'boundaryRevByReef' | 'legacyPoints' | 'allocationMode'>
   ): Promise<Belt> {
     const now = Date.now()
-    const row: Belt = { ...payload, siteId, id: createId('belt'), createdAt: now, updatedAt: now }
+    const settled = await initialSegments(siteId, payload.startPoint, payload.endPoint, payload.lengthM)
+    const row: Belt = {
+      ...payload,
+      ...settled,
+      allocationMode: 'prorate',
+      legacyPoints: false,
+      siteId,
+      id: createId('belt'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.belts.put(row)
     return row
   }
 
+  /** 外业补录 / 修订起止点后按当前界线重新切段对账 */
+  async function reconcileBelt(id: string): Promise<BeltSettleResult | null> {
+    return reconcileBeltById(id)
+  }
+
   async function updateBelt(id: string, patch: Partial<Belt>): Promise<void> {
+    const affectsSegments =
+      'startPoint' in patch || 'endPoint' in patch || 'lengthM' in patch || 'siteId' in patch
     await db.belts.update(id, { ...patch, updatedAt: Date.now() } as never)
+    // 起止点或长度一变，分段与对账状态必须按当前界线重算，保持与礁区白化同一口径
+    if (affectsSegments) await reconcileBeltById(id)
   }
 
   /** 删除样带：级联删除其珊瑚记录与鱼类计数 */
@@ -152,8 +232,12 @@ export const useBeltStore = defineStore('belt', () => {
     beltById,
     createBelt,
     updateBelt,
+    reconcileBelt,
     removeBelt,
     bulkSetOrientation,
+    pendingBelts,
+    crossReefBelts,
+    segmentsOfBelt,
     orientations: ORIENTATIONS
   }
 })

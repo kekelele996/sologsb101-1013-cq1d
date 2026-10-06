@@ -5,10 +5,12 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import { db, createId, readLastReefId, watchTable, writeLastReefId } from '@/utils/db'
-import type { Reef, ReefFilterState } from '@/types/reef'
+import type { Reef, ReefFilterState, LatLng } from '@/types/reef'
 import { createEmptyReefFilter } from '@/types/reef'
 import type { Site, SiteFilterState } from '@/types/site'
 import { createEmptySiteFilter } from '@/types/site'
+import { applyReefBoundary } from '@/utils/boundarySettle'
+import type { BoundaryChangeReport } from '@/utils/boundarySettle'
 import { bleachIndex, round } from '@/utils/bleach'
 
 export const useReefStore = defineStore('reef', () => {
@@ -143,13 +145,29 @@ export const useReefStore = defineStore('reef', () => {
 
   async function createReef(payload: Omit<Reef, 'id' | 'createdAt' | 'updatedAt'>): Promise<Reef> {
     const now = Date.now()
-    const row: Reef = { ...payload, id: createId('reef'), createdAt: now, updatedAt: now }
+    const row: Reef = {
+      ...payload,
+      boundaryPolygon: payload.boundaryPolygon ?? [],
+      boundaryRev: payload.boundaryRev ?? 0,
+      boundaryUpdatedAt: payload.boundaryUpdatedAt ?? null,
+      id: createId('reef'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.reefs.put(row)
     return row
   }
 
   async function updateReef(id: string, patch: Partial<Reef>): Promise<void> {
     await db.reefs.update(id, { ...patch, updatedAt: Date.now() } as never)
+  }
+
+  /**
+   * 界线测绘室改界：界线单独校验落库并 +1，成功后只重算压旧线的样带；
+   * 界线校验失败时错误上抛，样带一侧完全不动（调用方只重试界线这侧）。
+   */
+  async function saveBoundary(id: string, polygon: LatLng[]): Promise<BoundaryChangeReport> {
+    return applyReefBoundary(id, polygon)
   }
 
   /** 删除礁区：级联删除其站位、样带、珊瑚记录与鱼类计数 */
@@ -239,6 +257,7 @@ export const useReefStore = defineStore('reef', () => {
     siteById,
     createReef,
     updateReef,
+    saveBoundary,
     removeReef,
     createSite,
     updateSite,

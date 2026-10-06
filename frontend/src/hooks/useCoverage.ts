@@ -11,6 +11,8 @@ import { useSurveyStore } from '@/stores/surveyStore'
 import type { BleachLevel, CoralRecord, CoralForm } from '@/types/coralRecord'
 import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import type { BeltSegment } from '@/types/belt'
+import { isCrossReefBelt } from '@/types/belt'
 import {
   bleachGrade,
   bleachIndex,
@@ -22,7 +24,7 @@ import {
   round
 } from '@/utils/bleach'
 
-/** 单条样带的覆盖度成果 */
+/** 单条样带的覆盖度成果（整条观测口径，即外业实测量） */
 export interface BeltCoverage {
   beltId: string
   beltNo: string
@@ -34,11 +36,19 @@ export interface BeltCoverage {
   orientation: string
   surveyDate: string
   observer: string
+  /** 跨礁区分段（界线两侧各段，按段长分摊口径） */
+  segments: BeltSegment[]
+  /** 是否压在两个及以上礁区 */
+  crossReef: boolean
+  /** 两边按编号对账状态 */
+  settleStatus: 'settled' | 'pending'
+  /** 挂账原因 */
+  settleIssue: string
   coralCount: number
   coverCmTotal: number
-  /** 珊瑚覆盖率（%） */
+  /** 珊瑚覆盖率（%，整条实测） */
   coveragePct: number
-  /** 白化指数 0 ~ 4 */
+  /** 白化指数 0 ~ 4（整条实测） */
   bleachIndex: number
   grade: BleachLevel
   /** 白化占比（%） */
@@ -51,7 +61,7 @@ export interface BeltCoverage {
   byForm: Array<{ form: CoralForm; coverCm: number }>
   fishTotal: number
   invertebrateTotal: number
-  /** 鱼类密度（尾 / 100 m²） */
+  /** 鱼类密度（尾 / 100 m²，整条实测） */
   fishDensity: number
 }
 
@@ -159,6 +169,10 @@ export function useCoverage(): UseCoverageResult {
       orientation: belt.orientation,
       surveyDate: belt.surveyDate,
       observer: belt.observer,
+      segments: belt.segments,
+      crossReef: isCrossReefBelt(belt),
+      settleStatus: belt.settleStatus,
+      settleIssue: belt.settleIssue,
       coralCount: beltCorals.length,
       coverCmTotal,
       coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),

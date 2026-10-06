@@ -7,7 +7,7 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, Plus, Right, Warning } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, RefreshRight, Right, Warning } from '@element-plus/icons-vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import BleachTag from '@/components/common/BleachTag.vue'
@@ -17,6 +17,8 @@ import { ORIENTATION_ORDER, useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
 import { BELT_LENGTH_PRESETS, ORIENTATIONS } from '@/types/belt'
 import type { Belt, Orientation } from '@/types/belt'
+import { validateLatLng, formatLatLng } from '@/types/site'
+import type { LatLng } from '@/types/reef'
 import { bleachGrade, bleachIndex, coralCoveragePct, fishDensity } from '@/utils/bleach'
 import { initDatabase } from '@/utils/db'
 
@@ -38,10 +40,17 @@ const form = reactive({
   lengthM: 50,
   orientation: '北' as Orientation,
   surveyDate: new Date().toISOString().slice(0, 10),
-  observer: ''
+  observer: '',
+  startPoint: { lat: 0, lng: 0 } as LatLng,
+  endPoint: { lat: 0, lng: 0 } as LatLng
 })
 
-/** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率与白化指数 */
+/** 礁区名索引（跨界分段展示用） */
+const reefNameById = computed<Record<string, string>>(() =>
+  Object.fromEntries(reefStore.reefs.map((item) => [item.id, item.name]))
+)
+
+/** 样带行：回显珊瑚记录数、鱼类记录数、覆盖率、白化指数与跨区分段 */
 const rows = computed(() =>
   beltStore.beltsOfSite(siteId.value).map((belt) => {
     const corals = surveyStore.coralsOfBelt(belt.id)
@@ -49,6 +58,7 @@ const rows = computed(() =>
     const coverCmTotal = corals.reduce((sum, coral) => sum + coral.coverCm, 0)
     const index = bleachIndex(corals)
     const fishTotal = fishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
+    const crossReef = new Set(belt.segments.map((segment) => segment.reefId)).size > 1
     return {
       belt,
       coralCount: corals.length,
@@ -57,10 +67,17 @@ const rows = computed(() =>
       coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
       bleachIndex: index,
       grade: bleachGrade(index),
-      fishDensity: fishDensity(fishTotal, belt.lengthM)
+      fishDensity: fishDensity(fishTotal, belt.lengthM),
+      crossReef,
+      pending: belt.settleStatus === 'pending',
+      segments: belt.segments,
+      legacyPoints: belt.legacyPoints
     }
   })
 )
+
+/** 当前站位下的挂账样带数 */
+const pendingCount = computed(() => rows.value.filter((row) => row.pending).length)
 
 const conflicts = computed(() => beltStore.findBeltConflicts(siteId.value))
 
@@ -95,6 +112,10 @@ function openCreate(): void {
   form.orientation = ORIENTATIONS[existing.length % ORIENTATIONS.length]
   form.surveyDate = new Date().toISOString().slice(0, 10)
   form.observer = existing[0]?.observer ?? ''
+  // 外业默认起止点取站位坐标，实际起点终点由普查组在现场修正
+  const anchor = site.value ? { lat: site.value.lat, lng: site.value.lng } : { lat: 0, lng: 0 }
+  form.startPoint = { ...anchor }
+  form.endPoint = { ...anchor }
   dialogVisible.value = true
 }
 
@@ -105,6 +126,8 @@ function openEdit(belt: Belt): void {
   form.orientation = belt.orientation
   form.surveyDate = belt.surveyDate
   form.observer = belt.observer
+  form.startPoint = { ...belt.startPoint }
+  form.endPoint = { ...belt.endPoint }
   dialogVisible.value = true
 }
 
@@ -115,6 +138,14 @@ async function submitForm(): Promise<void> {
   }
   if (!Number.isFinite(form.lengthM) || form.lengthM <= 0) {
     ElMessage.warning('样带长度应为大于 0 的数字（m）')
+    return
+  }
+  const coordErrors = [
+    ...validateLatLng(form.startPoint.lat, form.startPoint.lng),
+    ...validateLatLng(form.endPoint.lat, form.endPoint.lng)
+  ]
+  if (coordErrors.length > 0) {
+    ElMessage.warning(`起止点经纬度校验未通过：${coordErrors.join('；')}`)
     return
   }
   if (!form.surveyDate) {
@@ -135,19 +166,38 @@ async function submitForm(): Promise<void> {
       lengthM: form.lengthM,
       orientation: form.orientation,
       surveyDate: form.surveyDate,
-      observer: form.observer.trim()
+      observer: form.observer.trim(),
+      startPoint: { ...form.startPoint },
+      endPoint: { ...form.endPoint }
     }
     if (editingId.value) {
       await beltStore.updateBelt(editingId.value, payload)
-      ElMessage.success('样带已更新')
+      ElMessage.success('样带与起止点已更新，并按当前界线重新切段对账')
     } else {
       const created = await beltStore.createBelt(siteId.value, payload)
       beltStore.selectBelt(created.id)
-      ElMessage.success(`样带 ${created.no}（${created.orientation}向 ${created.lengthM} m）已布设，可录入底质与珊瑚计数`)
+      if (created.settleStatus === 'pending') {
+        ElMessage.warning(`样带 ${created.no} 跨界对账不符已挂账：${created.settleIssue || '请核对起止点'}`)
+      } else {
+        ElMessage.success(`样带 ${created.no}（${created.orientation}向 ${created.lengthM} m）已布设并按界线切段`)
+      }
     }
     dialogVisible.value = false
   } finally {
     submitting.value = false
+  }
+}
+
+/** 外业补正起止点后按样带编号重新对账（界线未改也可重算这一侧） */
+async function reconcileBelt(belt: Belt): Promise<void> {
+  const result = await beltStore.reconcileBelt(belt.id)
+  if (!result) return
+  if (result.status === 'pending') {
+    ElMessage.warning(`样带 ${belt.no} 仍对不上，继续挂账：${result.issue}`)
+  } else {
+    ElMessage.success(
+      `样带 ${belt.no} 已对平${result.crossed ? '（跨界按段长分摊：' + result.segments.map((s) => `${s.lengthM} m`).join(' / ') + '）' : ''}`
+    )
   }
 }
 
@@ -188,6 +238,10 @@ function gotoCorals(belt: Belt): void {
 function gotoFishes(belt: Belt): void {
   beltStore.selectBelt(belt.id)
   void router.push(`/belts/${belt.id}/fishes`)
+}
+
+function rowClass({ row }: { row: { pending: boolean } }): string {
+  return row.pending ? 'gb-row-pending' : ''
 }
 
 onMounted(() => {
@@ -255,6 +309,14 @@ onMounted(() => {
         :title="`朝向排序校验提示：${conflicts.join('、')} 存在重复编号，请调整后再开展普查`"
       />
 
+      <el-alert
+        v-if="pendingCount > 0"
+        type="error"
+        show-icon
+        :closable="false"
+        :title="`本站位有 ${pendingCount} 条样带跨界对账不符已挂账，先不进入任何一侧礁区白化评定；补录起止点后点「重新对账」。`"
+      />
+
       <EmptyPanel
         v-if="rows.length === 0"
         title="该站位还没有样带"
@@ -263,55 +325,75 @@ onMounted(() => {
         @action="openCreate"
       />
 
-      <el-table v-else :data="rows" border stripe class="gb-table-compact">
-        <el-table-column prop="belt.no" label="样带编号" width="110" />
-        <el-table-column label="朝向" width="90" align="center">
+      <el-table v-else :data="rows" border stripe class="gb-table-compact" :row-class-name="rowClass">
+        <el-table-column prop="belt.no" label="样带编号" width="100" />
+        <el-table-column label="朝向" width="80" align="center">
           <template #default="{ row }">
             <el-tag size="small" effect="plain">{{ row.belt.orientation }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="长度 (m)" width="110" align="right">
+        <el-table-column label="长度 (m)" width="100" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.belt.lengthM }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="调查日期" width="130">
+        <el-table-column label="起止点（外业普查组）" min-width="220">
+          <template #default="{ row }">
+            <div class="gb-hint gb-mono">起 {{ formatLatLng(row.belt.startPoint.lat, row.belt.startPoint.lng) }}</div>
+            <div class="gb-hint gb-mono">止 {{ formatLatLng(row.belt.endPoint.lat, row.belt.endPoint.lng) }}</div>
+            <el-tag v-if="row.legacyPoints" size="small" type="info" effect="plain">旧数据按站位补的整段</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="界线段（段长分摊）" min-width="210">
+          <template #default="{ row }">
+            <div v-for="segment in row.segments" :key="`${row.belt.id}-${segment.reefId}`" class="belt-segment">
+              <span>{{ reefNameById[segment.reefId] ?? '未知礁区' }}</span>
+              <span class="gb-mono">{{ segment.lengthM }} m</span>
+            </div>
+            <div v-if="row.pending" class="gb-hint">挂账：{{ row.belt.settleIssue || '两边按编号对不上' }}</div>
+            <el-tag v-if="row.crossReef && !row.pending" size="small" type="warning" effect="plain">跨界已对平</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="调查日期" width="120">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.belt.surveyDate }}</span>
           </template>
         </el-table-column>
-        <el-table-column prop="belt.observer" label="调查人" width="110" />
-        <el-table-column label="珊瑚记录" width="120" align="center">
+        <el-table-column prop="belt.observer" label="调查人" width="90" />
+        <el-table-column label="珊瑚记录" width="100" align="center">
           <template #default="{ row }">
             <el-button text type="primary" size="small" @click="gotoCorals(row.belt)">
               {{ row.coralCount }} 条
             </el-button>
           </template>
         </el-table-column>
-        <el-table-column label="鱼类计数" width="120" align="center">
+        <el-table-column label="鱼类计数" width="100" align="center">
           <template #default="{ row }">
             <el-button text type="primary" size="small" @click="gotoFishes(row.belt)">
               {{ row.fishCount }} 条
             </el-button>
           </template>
         </el-table-column>
-        <el-table-column label="珊瑚覆盖率" width="130" align="right">
+        <el-table-column label="整条覆盖率" width="115" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coveragePct }}%</span>
             <div class="gb-hint gb-mono">{{ row.coverCmTotal }} cm</div>
           </template>
         </el-table-column>
-        <el-table-column label="白化" width="150">
+        <el-table-column label="白化" width="140">
           <template #default="{ row }">
             <BleachTag :level="row.grade" size="small" />
             <div class="gb-hint gb-mono">指数 {{ row.bleachIndex }}</div>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="260" fixed="right">
+        <el-table-column label="操作" width="320" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoCorals(row.belt)">珊瑚</el-button>
             <el-button size="small" @click="gotoFishes(row.belt)">鱼类</el-button>
-            <el-button size="small" :icon="Edit" @click="openEdit(row.belt)">编辑</el-button>
+            <el-button size="small" type="warning" plain :icon="RefreshRight" @click="reconcileBelt(row.belt)">
+              重新对账
+            </el-button>
+            <el-button size="small" :icon="Edit" @click="openEdit(row.belt)">起止点</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeBelt(row.belt)">删除</el-button>
           </template>
         </el-table-column>
@@ -353,6 +435,29 @@ onMounted(() => {
         <el-form-item label="调查人">
           <el-input v-model="form.observer" placeholder="如：林之遥" maxlength="20" />
         </el-form-item>
+        <el-form-item label="起点坐标" required>
+          <el-input-number v-model="form.startPoint.lat" :min="-90" :max="90" :step="0.0001" :precision="4" controls-position="right" />
+          <span class="page__unit">纬度</span>
+          <el-input-number v-model="form.startPoint.lng" :min="-180" :max="180" :step="0.0001" :precision="4" controls-position="right" />
+          <span class="page__unit">经度</span>
+        </el-form-item>
+        <el-form-item label="终点坐标" required>
+          <el-input-number v-model="form.endPoint.lat" :min="-90" :max="90" :step="0.0001" :precision="4" controls-position="right" />
+          <span class="page__unit">纬度</span>
+          <el-input-number v-model="form.endPoint.lng" :min="-180" :max="180" :step="0.0001" :precision="4" controls-position="right" />
+          <span class="page__unit">经度</span>
+          <div class="page__presets">
+            <el-button size="small" text type="primary" @click="form.endPoint = { ...form.startPoint }">
+              同起点（旧数据整段）
+            </el-button>
+          </div>
+        </el-form-item>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="保存后按测绘室当前界线自动切段；珊瑚覆盖与鱼类计数按各礁区段长比例分摊，礁区白化与导出共用该口径。"
+        />
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
@@ -406,5 +511,18 @@ onMounted(() => {
   flex-wrap: wrap;
   gap: 2px;
   margin-top: 4px;
+}
+
+.belt-segment {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+:deep(.gb-row-pending) {
+  background-color: #fdf3e3 !important;
 }
 </style>

@@ -16,6 +16,11 @@ import {
   type BleachLevel
 } from '@/types/coralRecord'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
+import { aggregateReef } from '@/utils/reefAggregation'
+import { splitBeltRecords } from '@/utils/allocation'
+import { isCrossReefBelt } from '@/types/belt'
+import type { Belt } from '@/types/belt'
+import { splitBeltByReefs } from '@/utils/geometry'
 
 /** 备份集合键名 */
 export const BACKUP_KEYS = ['reefs', 'sites', 'belts', 'corals', 'fishes'] as const
@@ -58,7 +63,7 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
-  const payload: BackupPayload = {
+  const normalized = normalizePayload({
     app: 'gbcoralbelt',
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
     exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : new Date().toISOString(),
@@ -67,8 +72,54 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     belts: obj.belts ?? [],
     corals: obj.corals ?? [],
     fishes: obj.fishes ?? []
-  }
-  return { ok: true, errors, payload }
+  })
+  return { ok: true, errors, payload: normalized }
+}
+
+/**
+ * 导入归一化：旧版本备份没有界线 / 起止点字段，按 v3 升级同一口径补齐——
+ * 旧数据没记起止点时，按站位坐标补一条整段样带（legacyPoints 标记）。
+ */
+export function normalizePayload(payload: BackupPayload): BackupPayload {
+  const reefs = payload.reefs.map((reef) => ({
+    ...reef,
+    boundaryPolygon: Array.isArray(reef.boundaryPolygon) ? reef.boundaryPolygon : [],
+    boundaryRev: typeof reef.boundaryRev === 'number' ? reef.boundaryRev : 0,
+    boundaryUpdatedAt: typeof reef.boundaryUpdatedAt === 'number' ? reef.boundaryUpdatedAt : null
+  }))
+  const siteById = new Map(payload.sites.map((site) => [site.id, site]))
+  const belts = payload.belts.map((belt) => {
+    const site = siteById.get(belt.siteId)
+    const startPoint =
+      belt.startPoint && Number.isFinite(belt.startPoint.lat) && Number.isFinite(belt.startPoint.lng)
+        ? belt.startPoint
+        : site
+          ? { lat: site.lat, lng: site.lng }
+          : { lat: 0, lng: 0 }
+    const endPoint =
+      belt.endPoint && Number.isFinite(belt.endPoint.lat) && Number.isFinite(belt.endPoint.lng)
+        ? belt.endPoint
+        : { ...startPoint }
+    const legacyPoints = typeof belt.legacyPoints === 'boolean' ? belt.legacyPoints : !belt.startPoint
+    const segments =
+      Array.isArray(belt.segments) && belt.segments.length > 0
+        ? belt.segments
+        : splitBeltByReefs(startPoint, endPoint, belt.lengthM ?? 50, site?.reefId ?? '', reefs).segments
+    return {
+      ...belt,
+      lengthM: typeof belt.lengthM === 'number' ? belt.lengthM : 50,
+      startPoint,
+      endPoint,
+      legacyPoints,
+      segments,
+      allocationMode: belt.allocationMode === 'origin' ? ('origin' as const) : ('prorate' as const),
+      settleStatus: belt.settleStatus === 'pending' ? ('pending' as const) : ('settled' as const),
+      settleIssue: typeof belt.settleIssue === 'string' ? belt.settleIssue : '',
+      boundaryRevByReef:
+        belt.boundaryRevByReef && typeof belt.boundaryRevByReef === 'object' ? belt.boundaryRevByReef : {}
+    } satisfies Belt
+  })
+  return { ...payload, reefs, belts }
 }
 
 /** 统计快照各表行数 */
@@ -161,7 +212,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
 /** 白化等级分布：各等级累计覆盖长度 */
 export type BleachDistribution = Record<BleachLevel, number>
 
-/** 覆盖度结论行：按样带汇总珊瑚覆盖率、白化占比与鱼类密度 */
+/** 覆盖度结论行：一条样带在某礁区一侧的分摊成果（跨界样带每个礁区一行） */
 export interface CoverageLine {
   beltId: string
   beltNo: string
@@ -170,14 +221,22 @@ export interface CoverageLine {
   siteId: string
   siteNo: string
   lengthM: number
+  /** 该礁区内的分段长度合计（m）；未跨界即样带全长 */
+  segmentLengthM: number
+  /** 段长占整条样带比例（0 ~ 1） */
+  segmentShare: number
   orientation: string
   surveyDate: string
   observer: string
+  /** 是否跨界样带 */
+  crossReef: boolean
+  settleStatus: 'settled' | 'pending'
+  settleIssue: string
   coralCount: number
   coverCmTotal: number
-  /** 珊瑚覆盖率（%） */
+  /** 珊瑚覆盖率（%，分摊覆盖长度 / 该礁区段长） */
   coveragePct: number
-  /** 白化指数 0 ~ 4 */
+  /** 白化指数 0 ~ 4（分摊后的覆盖长度加权） */
   bleachIndex: number
   /** 总体白化等级 */
   grade: BleachLevel
@@ -186,12 +245,16 @@ export interface CoverageLine {
   distribution: BleachDistribution
   fishTotal: number
   invertebrateTotal: number
-  /** 鱼类密度（尾 / 100 m²） */
+  /** 鱼类密度（尾 / 100 m²，分摊计数 / 段长） */
   fishDensity: number
   conclusion: string
 }
 
-/** 按样带生成覆盖度结论行 */
+/**
+ * 按「样带 × 礁区」生成覆盖度结论行：
+ * 珊瑚覆盖与鱼类计数按段长分摊，跨界且挂账的样带不进入任何一侧。
+ * 与页面礁区白化评定共用 utils/allocation 同一口径。
+ */
 export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
   const reefById = new Map(payload.reefs.map((reef) => [reef.id, reef]))
   const siteById = new Map(payload.sites.map((site) => [site.id, site]))
@@ -208,101 +271,147 @@ export function buildCoverageLines(payload: BackupPayload): CoverageLine[] {
     fishesByBelt.set(fish.beltId, list)
   })
 
-  return payload.belts
-    .map((belt) => {
-      const site = siteById.get(belt.siteId)
-      const reef = site ? reefById.get(site.reefId) : undefined
-      const corals = coralsByBelt.get(belt.id) ?? []
-      const fishes = fishesByBelt.get(belt.id) ?? []
-      const coverCmTotal = round(
-        corals.reduce((sum, coral) => sum + coral.coverCm, 0),
-        1
-      )
-      const index = bleachIndex(corals)
-      const grade = bleachGrade(index)
+  const lines: CoverageLine[] = []
+  payload.belts.forEach((belt) => {
+    const site = siteById.get(belt.siteId)
+    const originReef = site ? reefById.get(site.reefId) : undefined
+    const corals = coralsByBelt.get(belt.id) ?? []
+    const fishes = fishesByBelt.get(belt.id) ?? []
+    const slices = splitBeltRecords(belt, corals, fishes)
+    slices.forEach((slice) => {
+      const reef = reefById.get(slice.reefId)
       const distribution: BleachDistribution = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
       BLEACH_LEVELS.forEach((level) => {
         distribution[level] = round(
-          corals.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
+          slice.corals
+            .filter((coral) => coral.bleachLevel === level)
+            .reduce((sum, coral) => sum + coral.coverCm, 0),
           1
         )
       })
-      const fishTotal = fishes.filter((fish) => fish.category === '鱼类').reduce((sum, fish) => sum + fish.count, 0)
-      const invertebrateTotal = fishes
-        .filter((fish) => fish.category === '无脊椎动物')
-        .reduce((sum, fish) => sum + fish.count, 0)
-      return {
+      const coverCmTotal = round(
+        slice.corals.reduce((sum, coral) => sum + coral.coverCm, 0),
+        1
+      )
+      const index = bleachIndex(slice.corals)
+      const sharePct = bleachedSharePct(slice.corals)
+      const coverage = coralCoveragePct(coverCmTotal, slice.segmentLengthM || belt.lengthM)
+      const density = fishDensity(slice.fish, slice.segmentLengthM || belt.lengthM)
+      lines.push({
         beltId: belt.id,
         beltNo: belt.no,
-        reefId: reef?.id ?? '',
+        reefId: slice.reefId,
         reefName: reef?.name ?? '未知礁区',
         siteId: site?.id ?? '',
         siteNo: site?.no ?? '—',
         lengthM: belt.lengthM,
+        segmentLengthM: slice.segmentLengthM,
+        segmentShare: slice.share,
         orientation: belt.orientation,
         surveyDate: belt.surveyDate,
         observer: belt.observer,
+        crossReef: isCrossReefBelt(belt),
+        settleStatus: belt.settleStatus,
+        settleIssue: belt.settleIssue,
         coralCount: corals.length,
         coverCmTotal,
-        coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
+        coveragePct: coverage,
         bleachIndex: index,
-        grade,
-        bleachedSharePct: bleachedSharePct(corals),
+        grade: bleachGrade(index),
+        bleachedSharePct: sharePct,
         distribution,
-        fishTotal,
-        invertebrateTotal,
-        fishDensity: fishDensity(fishTotal, belt.lengthM),
+        fishTotal: slice.fish,
+        invertebrateTotal: slice.invertebrate,
+        fishDensity: density,
         conclusion:
           corals.length === 0
             ? '该样带尚未录入珊瑚记录'
-            : grade === '无'
-              ? `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，未见白化`
-              : `珊瑚覆盖率 ${coralCoveragePct(coverCmTotal, belt.lengthM)}%，白化指数 ${index}（${grade}），白化占比 ${bleachedSharePct(corals)}%`
-      }
+            : belt.settleStatus === 'pending' && isCrossReefBelt(belt)
+              ? `跨界样带编号 ${belt.no} 两边对账不符（${belt.settleIssue}），暂挂账不参与礁区评定`
+              : isCrossReefBelt(belt)
+                ? `跨界样带按段长 ${slice.segmentLengthM} m（${Math.round(slice.share * 100)}%）分摊：覆盖率 ${coverage}%，白化指数 ${index}（${bleachGrade(index)}），白化占比 ${sharePct}%`
+                : `珊瑚覆盖率 ${coverage}%，白化指数 ${index}（${bleachGrade(index)}），白化占比 ${sharePct}%`
+      })
     })
-    .sort((a, b) => b.bleachIndex - a.bleachIndex)
+    // 跨界挂账样带：splitBeltRecords 返回空，补一条挂账行锚定到起点礁区，导出可见但不参与统计
+    if (slices.length === 0 && isCrossReefBelt(belt)) {
+      const emptyDistribution: BleachDistribution = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
+      lines.push({
+        beltId: belt.id,
+        beltNo: belt.no,
+        reefId: originReef?.id ?? '',
+        reefName: `${originReef?.name ?? '未知礁区'}（挂账）`,
+        siteId: site?.id ?? '',
+        siteNo: site?.no ?? '—',
+        lengthM: belt.lengthM,
+        segmentLengthM: 0,
+        segmentShare: 0,
+        orientation: belt.orientation,
+        surveyDate: belt.surveyDate,
+        observer: belt.observer,
+        crossReef: true,
+        settleStatus: 'pending',
+        settleIssue: belt.settleIssue,
+        coralCount: 0,
+        coverCmTotal: 0,
+        coveragePct: 0,
+        bleachIndex: 0,
+        grade: '无',
+        bleachedSharePct: 0,
+        distribution: emptyDistribution,
+        fishTotal: 0,
+        invertebrateTotal: 0,
+        fishDensity: 0,
+        conclusion: `跨界样带编号 ${belt.no} 两边对账不符（${belt.settleIssue}），暂挂账不参与礁区评定`
+      })
+    }
+  })
+
+  return lines.sort((a, b) => b.bleachIndex - a.bleachIndex)
 }
 
-/** 按礁区汇总：站位/样带数量、平均白化指数与总体等级 */
+/** 按礁区汇总：站位/样带数量、段长分摊后的平均白化指数与总体等级（与页面同一口径） */
 export interface ReefSummary {
   reefId: string
   reefName: string
   protectStatus: string
   siteCount: number
   beltCount: number
+  countedBeltCount: number
   coralCount: number
   coverCmTotal: number
   avgBleachIndex: number
   grade: BleachLevel
   fishTotal: number
+  invertebrateTotal: number
+  countedSegmentLengthM: number
+  pendingBeltNos: string[]
 }
 
-export function buildReefSummaries(payload: BackupPayload, lines: CoverageLine[]): ReefSummary[] {
+export function buildReefSummaries(payload: BackupPayload): ReefSummary[] {
   return payload.reefs.map((reef) => {
-    const siteIds = new Set(payload.sites.filter((site) => site.reefId === reef.id).map((site) => site.id))
-    const beltIds = new Set(payload.belts.filter((belt) => siteIds.has(belt.siteId)).map((belt) => belt.id))
-    const corals = payload.corals.filter((coral) => beltIds.has(coral.beltId))
-    const lines4Reef = lines.filter((line) => line.reefId === reef.id)
-    const avgBleachIndex =
-      lines4Reef.length === 0
-        ? 0
-        : round(lines4Reef.reduce((sum, line) => sum + line.bleachIndex, 0) / lines4Reef.length, 2)
+    const agg = aggregateReef({
+      reef,
+      sites: payload.sites,
+      belts: payload.belts,
+      corals: payload.corals,
+      fishes: payload.fishes
+    })
     return {
       reefId: reef.id,
       reefName: reef.name,
       protectStatus: reef.protectStatus,
-      siteCount: siteIds.size,
-      beltCount: beltIds.size,
-      coralCount: corals.length,
-      coverCmTotal: round(
-        corals.reduce((sum, coral) => sum + coral.coverCm, 0),
-        1
-      ),
-      avgBleachIndex,
-      grade: bleachGrade(avgBleachIndex),
-      fishTotal: payload.fishes
-        .filter((fish) => beltIds.has(fish.beltId))
-        .reduce((sum, fish) => sum + fish.count, 0)
+      siteCount: agg.siteCount,
+      beltCount: agg.beltCount,
+      countedBeltCount: agg.countedBeltCount,
+      coralCount: agg.coralCount,
+      coverCmTotal: agg.coverCmTotal,
+      avgBleachIndex: agg.bleachIndex,
+      grade: agg.grade,
+      fishTotal: agg.fishTotal,
+      invertebrateTotal: agg.invertebrateTotal,
+      countedSegmentLengthM: agg.countedSegmentLengthM,
+      pendingBeltNos: agg.pendingBeltNos
     }
   })
 }

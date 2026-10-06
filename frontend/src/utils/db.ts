@@ -11,9 +11,10 @@ import type { Site } from '@/types/site'
 import type { Belt } from '@/types/belt'
 import type { CoralRecord } from '@/types/coralRecord'
 import type { FishCount } from '@/types/fishCount'
+import { splitBeltByReefs } from '@/utils/geometry'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbcoralbelt'
@@ -57,7 +58,7 @@ export class CoralBeltDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（位置/面积、经纬度/水深、样带长度与朝向、白化等级、类别）
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         reefs: 'id, name, location, protectStatus, areaKm2, manager, updatedAt',
         sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
@@ -85,6 +86,68 @@ export class CoralBeltDatabase extends Dexie {
               Object.assign(row, factory())
             })
         }
+      })
+
+    // v3：保护区界线重划——
+    // reefs 增加界线测绘室的界线多边形与修订序号；
+    // belts 增加外业普查组的起止点、跨礁区分段、分摊口径与对账状态。
+    this.version(DB_VERSION)
+      .stores({
+        reefs: 'id, name, location, protectStatus, areaKm2, manager, boundaryRev, boundaryUpdatedAt, updatedAt',
+        sites: 'id, reefId, no, lat, lng, depthM, substrate, updatedAt',
+        belts: 'id, siteId, no, lengthM, orientation, surveyDate, observer, settleStatus, allocationMode, updatedAt',
+        corals: 'id, beltId, genus, form, coverCm, bleachLevel, updatedAt',
+        fishes: 'id, beltId, family, count, sizeClass, category, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const now = Date.now()
+
+        // 界线这侧：旧礁区没有界线多边形，界线尚未测绘，修订序号记 0。
+        await tx
+          .table<Reef, string>('reefs')
+          .toCollection()
+          .modify((reef) => {
+            const row = reef as unknown as Record<string, unknown>
+            if (!Array.isArray(row.boundaryPolygon)) row.boundaryPolygon = []
+            if (typeof row.boundaryRev !== 'number') row.boundaryRev = 0
+            if (row.boundaryUpdatedAt === undefined) row.boundaryUpdatedAt = null
+            row.updatedAt = now
+          })
+
+        // 外业这侧：旧数据没记起止点，升级时按站位坐标补一条整段样带
+        // （起止点重合于站位、legacyPoints 标记，分段为整段留在起点礁区），
+        // 待界线测绘完成后由「界线重算」再切跨礁区分段。
+        const sites = await tx.table<Site, string>('sites').toArray()
+        const siteById = new Map(sites.map((site) => [site.id, site]))
+        const reefs = await tx.table<Reef, string>('reefs').toArray()
+        await tx
+          .table<Belt, string>('belts')
+          .toCollection()
+          .modify((belt) => {
+            const row = belt as unknown as Record<string, unknown>
+            const site = siteById.get(String(row.siteId))
+            const startPoint = site ? { lat: site.lat, lng: site.lng } : { lat: 0, lng: 0 }
+            const originReefId = site?.reefId ?? ''
+            if (!row.startPoint) row.startPoint = startPoint
+            if (!row.endPoint) row.endPoint = { ...startPoint }
+            if (typeof row.legacyPoints !== 'boolean') row.legacyPoints = true
+            if (!Array.isArray(row.segments) || row.segments.length === 0) {
+              // 已测绘界线的礁区顺带按新界线切一次；没有界线时整段归起点礁区。
+              const lengthM = typeof row.lengthM === 'number' ? row.lengthM : 50
+              row.segments = splitBeltByReefs(startPoint, startPoint, lengthM, originReefId, reefs).segments
+            }
+            if (row.allocationMode !== 'prorate' && row.allocationMode !== 'origin') {
+              row.allocationMode = 'prorate'
+            }
+            if (row.settleStatus !== 'settled' && row.settleStatus !== 'pending') {
+              row.settleStatus = 'settled'
+            }
+            if (typeof row.settleIssue !== 'string') row.settleIssue = ''
+            if (!row.boundaryRevByReef || typeof row.boundaryRevByReef !== 'object') {
+              row.boundaryRevByReef = {}
+            }
+            row.updatedAt = now
+          })
       })
   }
 }
@@ -140,6 +203,12 @@ interface SeedBelt {
   orientation: Belt['orientation']
   surveyDate: string
   observer: string
+  startPoint: Belt['startPoint']
+  endPoint: Belt['endPoint']
+  /** 跨界样带按编号两边已对平时置 settled；默认按切段结果自动判定 */
+  settleStatus?: Belt['settleStatus']
+  /** 挂账原因（对不上时演示用） */
+  settleIssue?: string
   corals: SeedCoral[]
   fishes: SeedFish[]
 }
@@ -152,6 +221,7 @@ export async function seedDemoData(): Promise<void> {
   const now = Date.now()
   const today = new Date(now).toISOString().slice(0, 10)
 
+  const boundaryNow = now - 30 * 24 * 3600 * 1000
   const reefs: Array<Omit<Reef, 'createdAt' | 'updatedAt'>> = [
     {
       id: 'reef_ql01',
@@ -159,7 +229,33 @@ export async function seedDemoData(): Promise<void> {
       location: '海南文昌清澜湾东侧 3.5 km 海域',
       areaKm2: 18.6,
       protectStatus: '核心区',
-      manager: '清澜湾海洋保护站'
+      manager: '清澜湾海洋保护站',
+      // 界线测绘室：南界与保护区隔壁「清澜湾南礁盘」共边
+      boundaryPolygon: [
+        { lat: 19.5660, lng: 110.7860 },
+        { lat: 19.5660, lng: 110.8140 },
+        { lat: 19.5480, lng: 110.8140 },
+        { lat: 19.5480, lng: 110.7860 }
+      ],
+      boundaryRev: 2,
+      boundaryUpdatedAt: boundaryNow
+    },
+    {
+      id: 'reef_ql04',
+      name: '清澜湾南礁盘',
+      location: '海南文昌清澜湾南侧礁盘（保护区隔壁）',
+      areaKm2: 9.2,
+      protectStatus: '未设区',
+      manager: '文昌市渔业站',
+      // 北界与清澜湾珊瑚礁区共边（19.5480），重划后样带 belt_ql02_a 跨这条界线
+      boundaryPolygon: [
+        { lat: 19.5480, lng: 110.7860 },
+        { lat: 19.5480, lng: 110.8140 },
+        { lat: 19.5360, lng: 110.8140 },
+        { lat: 19.5360, lng: 110.7860 }
+      ],
+      boundaryRev: 2,
+      boundaryUpdatedAt: boundaryNow
     },
     {
       id: 'reef_yr02',
@@ -167,7 +263,15 @@ export async function seedDemoData(): Promise<void> {
       location: '西沙永兴岛西侧礁盘外缘',
       areaKm2: 42.3,
       protectStatus: '缓冲区',
-      manager: '西沙海洋环境监测中心'
+      manager: '西沙海洋环境监测中心',
+      boundaryPolygon: [
+        { lat: 16.8420, lng: 112.3200 },
+        { lat: 16.8420, lng: 112.3360 },
+        { lat: 16.8260, lng: 112.3360 },
+        { lat: 16.8260, lng: 112.3200 }
+      ],
+      boundaryRev: 1,
+      boundaryUpdatedAt: boundaryNow
     },
     {
       id: 'reef_dz03',
@@ -175,7 +279,15 @@ export async function seedDemoData(): Promise<void> {
       location: '万宁大洲岛南岸潮下带',
       areaKm2: 6.4,
       protectStatus: '实验区',
-      manager: '大洲岛国家级自然保护区管理处'
+      manager: '大洲岛国家级自然保护区管理处',
+      boundaryPolygon: [
+        { lat: 18.6760, lng: 110.4860 },
+        { lat: 18.6760, lng: 110.4970 },
+        { lat: 18.6660, lng: 110.4970 },
+        { lat: 18.6660, lng: 110.4860 }
+      ],
+      boundaryRev: 1,
+      boundaryUpdatedAt: boundaryNow
     }
   ]
 
@@ -227,6 +339,8 @@ export async function seedDemoData(): Promise<void> {
       orientation: '北',
       surveyDate: today,
       observer: '林之遥',
+      startPoint: { lat: 19.5621, lng: 110.7924 },
+      endPoint: { lat: 19.5626, lng: 110.7924 },
       corals: [
         { id: 'cor_ql01a_1', beltId: 'belt_ql01_a', genus: '鹿角珊瑚属', form: '枝状', coverCm: 860, bleachLevel: '无', remark: '长势良好' },
         { id: 'cor_ql01a_2', beltId: 'belt_ql01_a', genus: '杯形珊瑚属', form: '枝状', coverCm: 540, bleachLevel: '轻', remark: '局部褪色' },
@@ -248,6 +362,8 @@ export async function seedDemoData(): Promise<void> {
       orientation: '东',
       surveyDate: today,
       observer: '林之遥',
+      startPoint: { lat: 19.5621, lng: 110.7924 },
+      endPoint: { lat: 19.5621, lng: 110.7930 },
       corals: [
         { id: 'cor_ql01b_1', beltId: 'belt_ql01_b', genus: '蔷薇珊瑚属', form: '叶状', coverCm: 720, bleachLevel: '中', remark: '边缘白化明显' },
         { id: 'cor_ql01b_2', beltId: 'belt_ql01_b', genus: '蜂巢珊瑚属', form: '块状', coverCm: 980, bleachLevel: '轻', remark: '' },
@@ -267,6 +383,11 @@ export async function seedDemoData(): Promise<void> {
       orientation: '南',
       surveyDate: today,
       observer: '周渝',
+      // 界线重划后这条样带一头在清澜湾珊瑚礁区、一头伸进隔壁清澜湾南礁盘
+      startPoint: { lat: 19.548135, lng: 110.8103 },
+      endPoint: { lat: 19.547865, lng: 110.8103 },
+      // 两边已按样带编号 T-01 对账对平：北段 15 m 留清澜湾，南段 15 m 分摊南礁盘
+      settleStatus: 'settled',
       corals: [
         { id: 'cor_ql02a_1', beltId: 'belt_ql02_a', genus: '滨珊瑚属', form: '块状', coverCm: 1240, bleachLevel: '无', remark: '' },
         { id: 'cor_ql02a_2', beltId: 'belt_ql02_a', genus: '陀螺珊瑚属', form: '块状', coverCm: 260, bleachLevel: '死亡', remark: '仅存骨骼，附着藻类' }
@@ -284,6 +405,8 @@ export async function seedDemoData(): Promise<void> {
       orientation: '西',
       surveyDate: today,
       observer: '陈立群',
+      startPoint: { lat: 16.8342, lng: 112.3286 },
+      endPoint: { lat: 16.8342, lng: 112.3275 },
       corals: [
         { id: 'cor_yr01a_1', beltId: 'belt_yr01_a', genus: '星珊瑚属', form: '块状', coverCm: 1580, bleachLevel: '轻', remark: '' },
         { id: 'cor_yr01a_2', beltId: 'belt_yr01_a', genus: '柳珊瑚属', form: '软珊瑚', coverCm: 640, bleachLevel: '中', remark: '水流较强区域' },
@@ -303,6 +426,8 @@ export async function seedDemoData(): Promise<void> {
       orientation: '东',
       surveyDate: today,
       observer: '陈立群',
+      startPoint: { lat: 18.6712, lng: 110.4913 },
+      endPoint: { lat: 18.6712, lng: 110.4916 },
       corals: [
         { id: 'cor_dz01a_1', beltId: 'belt_dz01_a', genus: '杯形珊瑚属', form: '枝状', coverCm: 520, bleachLevel: '重', remark: '受台风扰动后白化' },
         { id: 'cor_dz01a_2', beltId: 'belt_dz01_a', genus: '蜂巢珊瑚属', form: '块状', coverCm: 310, bleachLevel: '中', remark: '' }
@@ -320,14 +445,33 @@ export async function seedDemoData(): Promise<void> {
       updatedAt: now + offset
     })
 
-    await db.reefs.bulkPut(reefs.map((reef, index) => ({ ...reef, ...stamp(index) })))
+    await db.reefs.bulkPut(reefs.map((reef, index) => ({ ...reef, ...stamp(index) })) as Reef[])
     await db.sites.bulkPut(sites.map((site, index) => ({ ...site, ...stamp(100 + index) })))
     await db.belts.bulkPut(
       belts.map((belt, index) => {
-        const { corals, fishes, ...rest } = belt
+        const { corals, fishes, settleStatus, settleIssue, ...rest } = belt
         void corals
         void fishes
-        return { ...rest, ...stamp(200 + index) }
+        const site = sites.find((item) => item.id === belt.siteId)
+        const originReefId = site?.reefId ?? ''
+        // 播种时按当前界线把样带切成各礁区分段（分摊口径唯一，礁区白化与导出共用）
+        const split = splitBeltByReefs(belt.startPoint, belt.endPoint, belt.lengthM, originReefId, reefs as Reef[])
+        const status = settleStatus ?? (split.issues.length > 0 ? 'pending' : 'settled')
+        const revByReef: Record<string, number> = {}
+        split.segments.forEach((segment) => {
+          const reef = reefs.find((item) => item.id === segment.reefId)
+          if (reef) revByReef[segment.reefId] = reef.boundaryRev
+        })
+        return {
+          ...rest,
+          legacyPoints: false,
+          segments: split.segments,
+          allocationMode: 'prorate' as const,
+          settleStatus: status,
+          settleIssue: settleIssue ?? split.issues.join('；'),
+          boundaryRevByReef: revByReef,
+          ...stamp(200 + index)
+        }
       })
     )
     await db.corals.bulkPut(

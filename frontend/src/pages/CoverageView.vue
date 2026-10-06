@@ -57,6 +57,11 @@ const fileList = ref<UploadFile[]>([])
 const busy = ref(false)
 const notice = ref('')
 
+/** 礁区名称索引（跨界分段展示用） */
+const reefNameById = computed<Record<string, string>>(() =>
+  Object.fromEntries(reefStore.reefs.map((reef) => [reef.id, reef.name]))
+)
+
 const filterModel = computed<FilterModel>(() => ({
   keyword: surveyStore.filter.keyword,
   reefIds: surveyStore.filter.reefIds,
@@ -65,27 +70,35 @@ const filterModel = computed<FilterModel>(() => ({
 
 const rows = computed(() => surveyStore.filteredCoverageRows)
 
+/** 挂账跨界样带仅挂着核对，不参与各类指数 / 计数合计 */
+const countedRows = computed(() => rows.value.filter((row) => !(row.settleStatus === 'pending' && row.crossReef)))
+
 const totals = computed(() => ({
   belts: rows.value.length,
-  coralCount: rows.value.reduce((sum, row) => sum + row.coralCount, 0),
-  coverCmTotal: rows.value.reduce((sum, row) => sum + row.coverCmTotal, 0),
-  fishTotal: rows.value.reduce((sum, row) => sum + row.fishTotal, 0),
+  coralCount: countedRows.value.reduce((sum, row) => sum + row.coralCount, 0),
+  coverCmTotal: countedRows.value.reduce((sum, row) => sum + row.coverCmTotal, 0),
+  fishTotal: countedRows.value.reduce((sum, row) => sum + row.fishTotal, 0),
   avgCoveragePct:
-    rows.value.length === 0
+    countedRows.value.length === 0
       ? 0
-      : Number((rows.value.reduce((sum, row) => sum + row.coveragePct, 0) / rows.value.length).toFixed(2)),
+      : Number((countedRows.value.reduce((sum, row) => sum + row.coveragePct, 0) / countedRows.value.length).toFixed(2)),
   avgBleachIndex:
-    rows.value.length === 0
+    countedRows.value.length === 0
       ? 0
-      : Number((rows.value.reduce((sum, row) => sum + row.bleachIndex, 0) / rows.value.length).toFixed(2)),
-  bleachedBelts: rows.value.filter((row) => row.bleachedSharePct > 0).length
+      : Number((countedRows.value.reduce((sum, row) => sum + row.bleachIndex, 0) / countedRows.value.length).toFixed(2)),
+  bleachedBelts: countedRows.value.filter((row) => row.bleachedSharePct > 0).length
 }))
 
-/** 当前筛选结果内的白化等级分布 */
+/** 当前筛选结果内的白化等级分布（挂账跨界样带不参与统计） */
 const distribution = computed<Record<BleachLevel, number>>(() => {
   const result: Record<BleachLevel, number> = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
   BLEACH_LEVELS.forEach((level) => {
-    result[level] = Number(rows.value.reduce((sum, row) => sum + row.distribution[level], 0).toFixed(1))
+    result[level] = Number(
+      rows.value
+        .filter((row) => !(row.settleStatus === 'pending' && row.crossReef))
+        .reduce((sum, row) => sum + row.distribution[level], 0)
+        .toFixed(1)
+    )
   })
   return result
 })
@@ -99,34 +112,17 @@ function barPercent(value: number, total: number): string {
   return `${Math.min(100, (value / total) * 100).toFixed(1)}%`
 }
 
+/** 挂账样带行高亮，提醒两边按编号核对 */
+function beltRowClass({ row }: { row: { settleStatus: string } }): string {
+  return row.settleStatus === 'pending' ? 'gb-row-pending' : ''
+}
+
 async function refresh(): Promise<void> {
   counts.value = (await countAll()) as CountMap
   lastBackupAt.value = readLastBackupAt()
   stampedVersion.value = readStampedDbVersion()
   const payload = await buildBackupPayload()
-  reefSummaries.value = buildReefSummaries(payload, surveyStore.coverageRows.map((row) => ({
-    beltId: row.beltId,
-    beltNo: row.beltNo,
-    reefId: row.reefId,
-    reefName: row.reefName,
-    siteId: row.siteId,
-    siteNo: row.siteNo,
-    lengthM: row.lengthM,
-    orientation: row.orientation,
-    surveyDate: row.surveyDate,
-    observer: row.observer,
-    coralCount: row.coralCount,
-    coverCmTotal: row.coverCmTotal,
-    coveragePct: row.coveragePct,
-    bleachIndex: row.bleachIndex,
-    grade: row.grade,
-    bleachedSharePct: row.bleachedSharePct,
-    distribution: row.distribution,
-    fishTotal: row.fishTotal,
-    invertebrateTotal: row.invertebrateTotal,
-    fishDensity: row.fishDensity,
-    conclusion: ''
-  })))
+  reefSummaries.value = buildReefSummaries(payload)
 }
 
 function handleFilterChange(): void {
@@ -261,6 +257,18 @@ onMounted(() => {
 
     <el-alert v-if="notice" type="success" :closable="false" show-icon :title="notice" />
 
+    <el-alert
+      v-if="surveyStore.pendingBelts.length > 0"
+      type="warning"
+      show-icon
+      :closable="false"
+      :title="
+        `有 ${surveyStore.pendingBelts.length} 条跨界样带按编号两边对不上，已挂账（${surveyStore.pendingBelts
+          .map((belt) => belt.no)
+          .join('、')}），暂不进入任何一侧礁区白化评定；请到样带布设补录起止点后重算。`
+      "
+    />
+
     <div class="gb-stats-row">
       <StatBadge label="样带数" :value="totals.belts" suffix="条" icon="Files" />
       <StatBadge label="珊瑚记录" :value="totals.coralCount" suffix="条" tone="info" icon="Histogram" />
@@ -333,33 +341,50 @@ onMounted(() => {
         compact
       />
 
-      <el-table v-else :data="rows" border stripe class="gb-table-compact">
-        <el-table-column label="礁区 / 站位" min-width="180">
+      <el-table v-else :data="rows" border stripe class="gb-table-compact" :row-class-name="beltRowClass">
+        <el-table-column label="礁区 / 站位" min-width="200">
           <template #default="{ row }">
             <div>{{ row.reefName }}</div>
             <div class="gb-hint">站位 {{ row.siteNo }} · 样带 {{ row.beltNo }}（{{ row.orientation }}向）</div>
+            <el-tag v-if="row.crossReef" size="small" type="warning" effect="plain" class="page__cross-tag">跨界</el-tag>
+            <el-tag v-if="row.settleStatus === 'pending'" size="small" type="danger" effect="plain" class="page__cross-tag">
+              挂账
+            </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="样带长度" width="110" align="right">
+        <el-table-column label="界线段分摊" min-width="210">
+          <template #default="{ row }">
+            <div v-for="segment in row.segments" :key="`${row.beltId}-${segment.reefId}`" class="page__segment">
+              <span>{{ reefNameById[segment.reefId] ?? '未知礁区' }}</span>
+              <span class="gb-mono">
+                {{ segment.lengthM }} m · {{ Math.round((segment.lengthM / row.lengthM) * 100) }}%
+              </span>
+            </div>
+            <div v-if="row.settleStatus === 'pending'" class="gb-hint">对账不符：{{ row.settleIssue || '待外业核对' }}</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="样带长度" width="100" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.lengthM }} m</span>
           </template>
         </el-table-column>
-        <el-table-column label="珊瑚记录" width="100" align="right">
+        <el-table-column label="珊瑚记录" width="90" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coralCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="覆盖率" width="130" align="right">
+        <el-table-column label="整条覆盖率" width="120" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coveragePct }}%</span>
             <div class="gb-hint gb-mono">{{ row.coverCmTotal }} cm</div>
+            <div v-if="row.crossReef && row.settleStatus === 'settled'" class="gb-hint">外业实测量</div>
           </template>
         </el-table-column>
-        <el-table-column label="白化评定" width="170">
+        <el-table-column label="整条白化评定" width="160">
           <template #default="{ row }">
             <BleachTag :level="row.grade" size="small" />
             <div class="gb-hint gb-mono">指数 {{ row.bleachIndex }} · 白化占比 {{ row.bleachedSharePct }}%</div>
+            <div v-if="row.crossReef" class="gb-hint">礁区口径见下表</div>
           </template>
         </el-table-column>
         <el-table-column label="白化等级分布 (cm)" min-width="220">
@@ -401,36 +426,47 @@ onMounted(() => {
 
     <el-card shadow="never" class="gb-panel">
       <div class="gb-panel-title">
-        <h3>按礁区的白化评定</h3>
-        <span class="gb-hint">平均白化指数为礁区内各样带白化指数的算术平均</span>
+        <h3>按礁区的白化评定（段长分摊口径）</h3>
+        <span class="gb-hint">
+          跨界样带的珊瑚覆盖与鱼类计数按各礁区段长比例分摊；挂账样带不计入；白化指数按分摊后的覆盖长度加权
+        </span>
       </div>
       <el-table :data="reefSummaries" border stripe class="gb-table-compact">
         <el-table-column prop="reefName" label="礁区" min-width="160" />
-        <el-table-column prop="protectStatus" label="保护区状态" width="130" />
-        <el-table-column label="站位 / 样带" width="130" align="right">
+        <el-table-column prop="protectStatus" label="保护区状态" width="120" />
+        <el-table-column label="站位 / 压线样带" width="140" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.siteCount }} / {{ row.beltCount }}</span>
+            <div class="gb-hint gb-mono">计入 {{ row.countedBeltCount }} 条</div>
           </template>
         </el-table-column>
-        <el-table-column label="珊瑚记录" width="110" align="right">
+        <el-table-column label="计入段长" width="120" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.coralCount }}</span>
+            <span class="gb-mono">{{ row.countedSegmentLengthM }} m</span>
           </template>
         </el-table-column>
-        <el-table-column label="覆盖长度" width="130" align="right">
+        <el-table-column label="分摊覆盖长度" width="130" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.coverCmTotal }} cm</span>
           </template>
         </el-table-column>
-        <el-table-column label="平均白化指数" width="160">
+        <el-table-column label="白化指数" width="150">
           <template #default="{ row }">
             <BleachTag :level="row.grade" size="small" />
             <span class="gb-hint gb-mono"> {{ row.avgBleachIndex }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="鱼类计数" width="120" align="right">
+        <el-table-column label="鱼类 / 无脊椎" width="130" align="right">
           <template #default="{ row }">
-            <span class="gb-mono">{{ row.fishTotal }}</span>
+            <span class="gb-mono">{{ row.fishTotal }} / {{ row.invertebrateTotal }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="挂账样带" min-width="140">
+          <template #default="{ row }">
+            <el-tag v-if="row.pendingBeltNos.length === 0" size="small" type="success" effect="plain">无</el-tag>
+            <span v-else class="gb-hint">
+              <el-tag v-for="no in row.pendingBeltNos" :key="no" size="small" type="danger" effect="plain">{{ no }}</el-tag>
+            </span>
           </template>
         </el-table-column>
       </el-table>
@@ -529,5 +565,22 @@ onMounted(() => {
 .page__mini-bar {
   display: block;
   height: 100%;
+}
+
+.page__cross-tag {
+  margin: 4px 4px 0 0;
+}
+
+.page__segment {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+:deep(.gb-row-pending) {
+  background-color: #fdf3e3 !important;
 }
 </style>

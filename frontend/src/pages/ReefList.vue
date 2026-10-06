@@ -18,9 +18,11 @@ import { useReefStore } from '@/stores/reefStore'
 import { useBeltStore } from '@/stores/beltStore'
 import { useSurveyStore } from '@/stores/surveyStore'
 import { AREA_BUCKETS, createEmptyReefFilter, PROTECT_STATUSES } from '@/types/reef'
-import type { ProtectStatus, Reef } from '@/types/reef'
-import { bleachGrade, bleachIndex } from '@/utils/bleach'
+import type { LatLng, ProtectStatus, Reef } from '@/types/reef'
+import { validateBoundary } from '@/types/reef'
+import { aggregateAllReefs } from '@/utils/reefAggregation'
 import { initDatabase } from '@/utils/db'
+import type { BoundaryChangeReport } from '@/utils/boundarySettle'
 
 const route = useRoute()
 const router = useRouter()
@@ -40,27 +42,96 @@ const form = reactive({
   manager: ''
 })
 
-/** 礁区卡片：汇总站位/样带/珊瑚记录数与平均白化指数 */
-const cards = computed(() =>
-  reefStore.filteredReefs.map((reef: Reef) => {
+/* --------------------------- 界线测绘室：礁区界线 --------------------------- */
+const boundaryDialogVisible = ref(false)
+const boundaryReef = ref<Reef | null>(null)
+const boundarySaving = ref(false)
+const boundaryDraft = ref<Array<{ lat: number; lng: number }>>([])
+const lastBoundaryReport = ref<BoundaryChangeReport | null>(null)
+
+/** 界线点文本：每行「纬度,经度」，方便测绘室批量粘贴 */
+const boundaryText = computed({
+  get: () => boundaryDraft.value.map((point) => `${point.lat},${point.lng}`).join('\n'),
+  set: (value: string) => {
+    boundaryDraft.value = value
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const [lat, lng] = line.split(/[,，\s\t]+/).map((cell) => Number(cell))
+        return { lat, lng }
+      })
+  }
+})
+
+const boundaryErrors = computed<string[]>(() => validateBoundary(boundaryDraft.value as LatLng[]))
+
+function openBoundary(reef: Reef): void {
+  boundaryReef.value = reef
+  boundaryDraft.value = reef.boundaryPolygon.map((point) => ({ ...point }))
+  lastBoundaryReport.value = null
+  boundaryDialogVisible.value = true
+}
+
+function addBoundaryPoint(): void {
+  const last = boundaryDraft.value[boundaryDraft.value.length - 1] ?? { lat: 18.5, lng: 110.5 }
+  boundaryDraft.value.push({ lat: last.lat, lng: last.lng })
+}
+
+function removeBoundaryPoint(index: number): void {
+  boundaryDraft.value.splice(index, 1)
+}
+
+/** 界线先单独落库；失败只停在界线这侧，成功后系统只重算压旧线的样带 */
+async function submitBoundary(): Promise<void> {
+  if (!boundaryReef.value) return
+  if (boundaryErrors.value.length > 0) {
+    ElMessage.warning(`界线校验未通过：${boundaryErrors.value.join('；')}`)
+    return
+  }
+  boundarySaving.value = true
+  try {
+    const report = await reefStore.saveBoundary(boundaryReef.value.id, boundaryDraft.value as LatLng[])
+    lastBoundaryReport.value = report
+    boundaryReef.value = reefStore.reefById(boundaryReef.value.id)
+    const pendingText =
+      report.pendingBeltNos.length > 0 ? `；挂账样带：${report.pendingBeltNos.join('、')}` : ''
+    ElMessage.success(
+      `界线已保存（修订序号 ${report.boundaryRev}），按编号重算 ${report.reconciled.length} 条压旧线样带${pendingText}`
+    )
+  } catch (error) {
+    // 界线校验 / 落库失败：样带一侧未做任何改动，只提示重试界线这侧
+    ElMessage.error(error instanceof Error ? error.message : '界线保存失败，请仅重试界线修改')
+  } finally {
+    boundarySaving.value = false
+  }
+}
+
+/** 礁区卡片：站位 / 压线样带 / 段长分摊后的珊瑚覆盖与白化指数（与导出同一口径） */
+const cards = computed(() => {
+  const aggregations = aggregateAllReefs({
+    reefs: reefStore.reefs,
+    sites: reefStore.sites,
+    belts: beltStore.belts,
+    corals: surveyStore.corals,
+    fishes: surveyStore.fishes
+  })
+  const aggByReef = new Map(aggregations.map((agg) => [agg.reefId, agg]))
+  return reefStore.filteredReefs.map((reef: Reef) => {
     const sites = reefStore.sites.filter((site) => site.reefId === reef.id)
-    const siteIds = new Set(sites.map((site) => site.id))
-    const belts = beltStore.belts.filter((belt) => siteIds.has(belt.siteId))
-    const beltIds = new Set(belts.map((belt) => belt.id))
-    const corals = surveyStore.corals.filter((coral) => beltIds.has(coral.beltId))
-    const fishes = surveyStore.fishes.filter((fish) => beltIds.has(fish.beltId))
-    const index = bleachIndex(corals)
+    const agg = aggByReef.get(reef.id)
     return {
       reef,
       siteCount: sites.length,
-      beltCount: belts.length,
-      coralCount: corals.length,
-      fishTotal: fishes.reduce((sum, fish) => sum + fish.count, 0),
-      bleachIndex: index,
-      grade: bleachGrade(index)
+      beltCount: agg?.beltCount ?? 0,
+      coralCount: agg?.coralCount ?? 0,
+      fishTotal: agg?.fishTotal ?? 0,
+      bleachIndex: agg?.bleachIndex ?? 0,
+      grade: agg?.grade ?? '无',
+      pendingBeltNos: agg?.pendingBeltNos ?? []
     }
   })
-)
+})
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: reefStore.filter.keyword,
@@ -155,7 +226,12 @@ async function submitForm(): Promise<void> {
       await reefStore.updateReef(editingId.value, { ...form })
       ElMessage.success('礁区信息已更新')
     } else {
-      const created = await reefStore.createReef({ ...form })
+      const created = await reefStore.createReef({
+        ...form,
+        boundaryPolygon: [],
+        boundaryRev: 0,
+        boundaryUpdatedAt: null
+      })
       reefStore.selectReef(created.id)
       ElMessage.success('礁区已新建，可进入站位布设')
     }
@@ -305,8 +381,18 @@ watch(
 
         <p v-if="card.reef.location" class="reef-card__location">{{ card.reef.location }}</p>
 
+        <div class="reef-card__boundary">
+          <el-tag size="small" :type="card.reef.boundaryPolygon.length > 0 ? 'success' : 'info'" effect="plain">
+            {{ card.reef.boundaryPolygon.length > 0 ? `界线已测绘（${card.reef.boundaryPolygon.length} 顶点 · 修订 ${card.reef.boundaryRev}）` : '界线未测绘' }}
+          </el-tag>
+          <el-tag v-if="card.pendingBeltNos.length > 0" size="small" type="danger" effect="plain">
+            挂账样带 {{ card.pendingBeltNos.join('、') }}
+          </el-tag>
+        </div>
+
         <div class="reef-card__actions">
           <el-button type="primary" size="small" :icon="Right" @click="gotoSites(card.reef)">站位布设</el-button>
+          <el-button size="small" @click="openBoundary(card.reef)">界线测绘</el-button>
           <el-button size="small" :icon="Edit" @click="openEdit(card.reef)">编辑</el-button>
           <el-button size="small" type="danger" plain :icon="Delete" @click="removeReef(card.reef)">删除</el-button>
         </div>
@@ -339,6 +425,64 @@ watch(
         <el-button type="primary" :loading="submitting" @click="submitForm">
           {{ editingId ? '保存修改' : '新建并布设站位' }}
         </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="boundaryDialogVisible"
+      :title="`界线测绘 · ${boundaryReef?.name ?? ''}`"
+      width="720px"
+      :close-on-click-modal="false"
+    >
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="界线测绘室只维护礁区边界线；保存后系统自动重算压在旧线上的样带。界线校验失败时只重试本侧，样带起止点与覆盖计数不受影响。"
+        class="reef-boundary__alert"
+      />
+      <div class="reef-boundary">
+        <div class="reef-boundary__points">
+          <div v-for="(point, index) in boundaryDraft" :key="index" class="reef-boundary__row">
+            <span class="gb-mono reef-boundary__idx">{{ index + 1 }}</span>
+            <el-input-number v-model="point.lat" :min="-90" :max="90" :step="0.0001" :precision="4" controls-position="right" size="small" />
+            <el-input-number v-model="point.lng" :min="-180" :max="180" :step="0.0001" :precision="4" controls-position="right" size="small" />
+            <el-button size="small" type="danger" text :icon="Delete" @click="removeBoundaryPoint(index)" />
+          </div>
+          <el-button size="small" :icon="Plus" plain @click="addBoundaryPoint">追加顶点</el-button>
+          <p v-if="boundaryDraft.length > 0 && boundaryDraft.length < 3" class="reef-boundary__hint">
+            至少需要 3 个顶点才能围成礁区界线
+          </p>
+        </div>
+        <div class="reef-boundary__paste">
+          <span class="reef-boundary__hint">批量粘贴：每行「纬度,经度」</span>
+          <el-input
+            :model-value="boundaryText"
+            type="textarea"
+            :rows="8"
+            placeholder="19.5660,110.7860&#10;19.5660,110.8140"
+            @update:model-value="boundaryText = $event"
+          />
+          <ul v-if="boundaryErrors.length > 0" class="reef-boundary__errors">
+            <li v-for="error in boundaryErrors" :key="error">{{ error }}</li>
+          </ul>
+        </div>
+      </div>
+
+      <el-alert
+        v-if="lastBoundaryReport"
+        type="success"
+        :closable="false"
+        show-icon
+        :title="
+          `已按样带编号重算 ${lastBoundaryReport.reconciled.length} 条压旧线样带：跨界 ${lastBoundaryReport.crossedBeltNos.length} 条、挂账 ${lastBoundaryReport.pendingBeltNos.length} 条。`
+        "
+        class="reef-boundary__alert"
+      />
+
+      <template #footer>
+        <el-button @click="boundaryDialogVisible = false">关闭</el-button>
+        <el-button type="primary" :loading="boundarySaving" @click="submitBoundary">保存界线并重算样带</el-button>
       </template>
     </el-dialog>
   </section>
@@ -435,5 +579,61 @@ watch(
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 12px;
+}
+
+.reef-card__boundary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.reef-boundary {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(260px, 1fr);
+  gap: 16px;
+  margin-top: 10px;
+}
+
+.reef-boundary__alert {
+  margin-top: 8px;
+}
+
+.reef-boundary__points {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.reef-boundary__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.reef-boundary__idx {
+  width: 20px;
+  color: #4c6663;
+}
+
+.reef-boundary__paste {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.reef-boundary__hint {
+  margin: 2px 0;
+  font-size: 12px;
+  color: #7c9995;
+}
+
+.reef-boundary__errors {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: #c0392b;
 }
 </style>

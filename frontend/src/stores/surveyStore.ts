@@ -10,8 +10,10 @@ import { BLEACH_LEVELS } from '@/types/coralRecord'
 import type { CountCategory, FishCount, SizeClass } from '@/types/fishCount'
 import type { Reef } from '@/types/reef'
 import type { Site } from '@/types/site'
-import type { Belt } from '@/types/belt'
+import type { Belt, BeltSegment } from '@/types/belt'
+import { isCrossReefBelt } from '@/types/belt'
 import { bleachGrade, bleachIndex, bleachedSharePct, coralCoveragePct, fishDensity, round } from '@/utils/bleach'
+import { aggregateAllReefs } from '@/utils/reefAggregation'
 
 /** 覆盖度汇总页筛选条件 */
 export interface SurveyFilterState {
@@ -31,7 +33,7 @@ export function createEmptySurveyFilter(): SurveyFilterState {
   }
 }
 
-/** 覆盖度汇总行 */
+/** 覆盖度汇总行（整条样带的外业实测量；礁区口径按分段分摊见 reefAggregations） */
 export interface CoverageSummaryRow {
   beltId: string
   beltNo: string
@@ -43,6 +45,11 @@ export interface CoverageSummaryRow {
   orientation: string
   surveyDate: string
   observer: string
+  /** 界线切段（跨界样带两侧各一段） */
+  segments: BeltSegment[]
+  crossReef: boolean
+  settleStatus: Belt['settleStatus']
+  settleIssue: string
   coralCount: number
   coverCmTotal: number
   coveragePct: number
@@ -169,6 +176,10 @@ export const useSurveyStore = defineStore('survey', () => {
           orientation: belt.orientation,
           surveyDate: belt.surveyDate,
           observer: belt.observer,
+          segments: belt.segments,
+          crossReef: isCrossReefBelt(belt),
+          settleStatus: belt.settleStatus,
+          settleIssue: belt.settleIssue,
           coralCount: beltCorals.length,
           coverCmTotal,
           coveragePct: coralCoveragePct(coverCmTotal, belt.lengthM),
@@ -212,29 +223,49 @@ export const useSurveyStore = defineStore('survey', () => {
       filter.value.onlyBleached
   )
 
-  /** 全局白化等级分布与总体指数 */
+  /** 全局白化等级分布与总体指数（挂账跨界样带不参与统计） */
   const globalStats = computed(() => {
+    const pendingCrossIds = new Set(
+      belts.value
+        .filter((belt) => belt.settleStatus === 'pending' && isCrossReefBelt(belt))
+        .map((belt) => belt.id)
+    )
+    const countedCorals = corals.value.filter((coral) => !pendingCrossIds.has(coral.beltId))
     const distribution: Record<BleachLevel, number> = { 无: 0, 轻: 0, 中: 0, 重: 0, 死亡: 0 }
     BLEACH_LEVELS.forEach((level) => {
       distribution[level] = round(
-        corals.value.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
+        countedCorals.filter((coral) => coral.bleachLevel === level).reduce((sum, coral) => sum + coral.coverCm, 0),
         1
       )
     })
-    const index = bleachIndex(corals.value)
+    const index = bleachIndex(countedCorals)
     return {
-      coralCount: corals.value.length,
+      coralCount: countedCorals.length,
       fishCount: fishes.value.length,
       coverCmTotal: round(
-        corals.value.reduce((sum, coral) => sum + coral.coverCm, 0),
+        countedCorals.reduce((sum, coral) => sum + coral.coverCm, 0),
         1
       ),
       bleachIndex: index,
       grade: bleachGrade(index),
-      bleachedSharePct: bleachedSharePct(corals.value),
+      bleachedSharePct: bleachedSharePct(countedCorals),
       distribution
     }
   })
+
+  /** 各礁区白化聚合（唯一口径：跨界样带按段长分摊，挂账样带不计入） */
+  const reefAggregations = computed(() =>
+    aggregateAllReefs({
+      reefs: reefs.value,
+      sites: sites.value,
+      belts: belts.value,
+      corals: corals.value,
+      fishes: fishes.value
+    })
+  )
+
+  /** 挂账样带（界线重划后两边按编号对不上，先挂着待外业补起止点） */
+  const pendingBelts = computed<Belt[]>(() => belts.value.filter((belt) => belt.settleStatus === 'pending'))
 
   function patchFilter(patch: Partial<SurveyFilterState>): void {
     filter.value = { ...filter.value, ...patch }
@@ -386,6 +417,8 @@ export const useSurveyStore = defineStore('survey', () => {
     beltRecordCounts,
     coverageRows,
     filteredCoverageRows,
+    reefAggregations,
+    pendingBelts,
     hasFilter,
     globalStats,
     start,

@@ -21,6 +21,7 @@ import { useSurveyStore } from '@/stores/surveyStore'
 import { formatLatLng, SUBSTRATES, validateLatLng } from '@/types/site'
 import type { Site } from '@/types/site'
 import { bleachGrade, bleachIndex } from '@/utils/bleach'
+import { splitBeltRecords } from '@/utils/allocation'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
@@ -54,16 +55,26 @@ const rows = computed(() => {
   })
   return sites.map((site) => {
     const belts = beltStore.beltsOfSite(site.id)
-    const beltIds = new Set(belts.map((belt) => belt.id))
-    const corals = surveyStore.corals.filter((coral) => beltIds.has(coral.beltId))
-    const index = bleachIndex(corals)
+    // 站位只属于一个礁区：跨界样带只取本礁区段长比例内的覆盖长度
+    const slicedCorals: Array<{ coverCm: number; bleachLevel: import('@/types/coralRecord').BleachLevel }> = []
+    let pendingCross = 0
+    belts.forEach((belt) => {
+      const beltCorals = surveyStore.corals.filter((coral) => coral.beltId === belt.id)
+      const beltFishes = surveyStore.fishes.filter((fish) => fish.beltId === belt.id)
+      const slices = splitBeltRecords(belt, beltCorals, beltFishes)
+      const mine = slices.find((slice) => slice.reefId === site.reefId)
+      if (mine) slicedCorals.push(...mine.corals)
+      else if (belt.settleStatus === 'pending') pendingCross += 1
+    })
+    const index = bleachIndex(slicedCorals)
     return {
       site,
       beltCount: belts.length,
       beltLengthM: belts.reduce((sum, belt) => sum + belt.lengthM, 0),
-      coralCount: corals.length,
+      coralCount: slicedCorals.length,
       bleachIndex: index,
-      grade: bleachGrade(index)
+      grade: bleachGrade(index),
+      pendingCross
     }
   })
 })
@@ -303,10 +314,13 @@ onMounted(() => {
             <span class="gb-mono">{{ row.coralCount }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="平均白化" width="150">
+        <el-table-column label="平均白化" width="170">
           <template #default="{ row }">
             <BleachTag :level="row.grade" :size="'small'" />
             <span class="gb-hint gb-mono"> {{ row.bleachIndex }}</span>
+            <el-tag v-if="row.pendingCross > 0" size="small" type="danger" effect="plain">
+              {{ row.pendingCross }} 条挂账
+            </el-tag>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="240" fixed="right">
